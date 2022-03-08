@@ -37,6 +37,9 @@
 #include <Protocol/DriverBinding.h>
 #include <Ventoy.h>
 
+#define ASSIGN_REPLACE(This, replace) \
+    replace = (This->FlushEx == ventoy_wrapper_file_flush_ex) ? &g_efi_file_replace : &g_img_file_replace
+
 UINT8 *g_iso_data_buf = NULL;
 UINTN g_iso_buf_size = 0;
 BOOLEAN gMemdiskMode = FALSE;
@@ -809,11 +812,6 @@ STATIC BOOLEAN ventoy_filesystem_need_wrapper(IN CONST CHAR16 *DrvName)
      *
      */
     
-    if (StrStr(UpperDrvName, L"ISO9660") || StrStr(UpperDrvName, L"UDF"))
-    {
-        return TRUE;
-    }
-
     if (StrStr(UpperDrvName, L"REFIND") && StrStr(UpperDrvName, L"FILE SYSTEM"))
     {
         return TRUE;
@@ -915,7 +913,6 @@ STATIC EFI_STATUS ventoy_find_filesystem_driverbind(VOID)
         Status = gBS->HandleProtocol(Handles[i], &gEfiComponentNameProtocolGuid, (VOID **)&NameProtocol);
         if (EFI_ERROR(Status))
         {
-            debug();
             continue;
         }
 
@@ -1144,14 +1141,15 @@ EFI_STATUS EFIAPI ventoy_install_blockio(IN EFI_HANDLE ImageHandle, IN UINT64 Im
     {
         gBlockData.Media.BlockSize = 512;
         gBlockData.Media.LastBlock = ImgSize / 512 - 1;
+        gBlockData.Media.ReadOnly = FALSE;
     }
     else
     {
         gBlockData.Media.BlockSize = 2048;
         gBlockData.Media.LastBlock = ImgSize / 2048 - 1;        
+        gBlockData.Media.ReadOnly = TRUE;
     }
     
-    gBlockData.Media.ReadOnly = TRUE;
     gBlockData.Media.MediaPresent = 1;
     gBlockData.Media.LogicalBlocksPerPhysicalBlock = 1;
 
@@ -1250,6 +1248,15 @@ ventoy_wrapper_file_flush_ex(EFI_FILE_HANDLE This, EFI_FILE_IO_TOKEN *Token)
 	return EFI_SUCCESS;
 }
 
+/* Ex version */
+STATIC EFI_STATUS EFIAPI
+ventoy_wrapper_file_flush_ex_img(EFI_FILE_HANDLE This, EFI_FILE_IO_TOKEN *Token)
+{
+    (VOID)This;
+    (VOID)Token;
+	return EFI_SUCCESS;
+}
+
 
 STATIC EFI_STATUS EFIAPI
 ventoy_wrapper_file_write(EFI_FILE_HANDLE This, UINTN *Len, VOID *Data)
@@ -1275,19 +1282,20 @@ ventoy_wrapper_file_close(EFI_FILE_HANDLE This)
     return EFI_SUCCESS;
 }
 
-
 STATIC EFI_STATUS EFIAPI
 ventoy_wrapper_file_set_pos(EFI_FILE_HANDLE This, UINT64 Position)
 {
-    (VOID)This;
-        
-    if (Position <= g_efi_file_replace.FileSizeBytes)
+    ventoy_efi_file_replace *replace = NULL;
+
+    ASSIGN_REPLACE(This, replace);
+    
+    if (Position <= replace->FileSizeBytes)
     {
-        g_efi_file_replace.CurPos = Position;
+        replace->CurPos = Position;
     }
     else
     {
-        g_efi_file_replace.CurPos = g_efi_file_replace.FileSizeBytes;
+        replace->CurPos = replace->FileSizeBytes;
     }
     
     return EFI_SUCCESS;
@@ -1296,9 +1304,11 @@ ventoy_wrapper_file_set_pos(EFI_FILE_HANDLE This, UINT64 Position)
 STATIC EFI_STATUS EFIAPI
 ventoy_wrapper_file_get_pos(EFI_FILE_HANDLE This, UINT64 *Position)
 {
-    (VOID)This;
+    ventoy_efi_file_replace *replace = NULL;
 
-    *Position = g_efi_file_replace.CurPos;
+    ASSIGN_REPLACE(This, replace);
+
+    *Position = replace->CurPos;
 
     return EFI_SUCCESS;
 }
@@ -1308,6 +1318,9 @@ STATIC EFI_STATUS EFIAPI
 ventoy_wrapper_file_get_info(EFI_FILE_HANDLE This, EFI_GUID *Type, UINTN *Len, VOID *Data)
 {
     EFI_FILE_INFO *Info = (EFI_FILE_INFO *) Data;
+    ventoy_efi_file_replace *replace = NULL;
+
+    ASSIGN_REPLACE(This, replace);
 
     debug("ventoy_wrapper_file_get_info ... %u", *Len);
 
@@ -1325,8 +1338,8 @@ ventoy_wrapper_file_get_info(EFI_FILE_HANDLE This, EFI_GUID *Type, UINTN *Len, V
     ZeroMem(Data, sizeof(EFI_FILE_INFO));
 
     Info->Size = sizeof(EFI_FILE_INFO);
-    Info->FileSize = g_efi_file_replace.FileSizeBytes;
-    Info->PhysicalSize = g_efi_file_replace.FileSizeBytes;
+    Info->FileSize = replace->FileSizeBytes;
+    Info->PhysicalSize = replace->FileSizeBytes;
     Info->Attribute = EFI_FILE_READ_ONLY;
     //Info->FileName = EFI_FILE_READ_ONLY;
 
@@ -1340,23 +1353,24 @@ ventoy_wrapper_file_read(EFI_FILE_HANDLE This, UINTN *Len, VOID *Data)
 {
     EFI_LBA Lba;
     UINTN ReadLen = *Len;
-    
-    (VOID)This;
+    ventoy_efi_file_replace *replace = NULL;
 
+    ASSIGN_REPLACE(This, replace);
+    
     debug("ventoy_wrapper_file_read ... %u", *Len);
 
-    if (g_efi_file_replace.CurPos + ReadLen > g_efi_file_replace.FileSizeBytes)
+    if (replace->CurPos + ReadLen > replace->FileSizeBytes)
     {
-        ReadLen = g_efi_file_replace.FileSizeBytes - g_efi_file_replace.CurPos;
+        ReadLen = replace->FileSizeBytes - replace->CurPos;
     }
 
-    Lba = g_efi_file_replace.CurPos / 2048 + g_efi_file_replace.BlockIoSectorStart;
+    Lba = replace->CurPos / 2048 + replace->BlockIoSectorStart;
 
     ventoy_block_io_read(NULL, 0, Lba, ReadLen, Data);
 
     *Len = ReadLen;
 
-    g_efi_file_replace.CurPos += ReadLen;
+    replace->CurPos += ReadLen;
 
     return EFI_SUCCESS;
 }
@@ -1367,7 +1381,7 @@ ventoy_wrapper_file_read_ex(IN EFI_FILE_PROTOCOL *This, IN OUT EFI_FILE_IO_TOKEN
 	return ventoy_wrapper_file_read(This, &(Token->BufferSize), Token->Buffer);
 }
 
-STATIC EFI_STATUS EFIAPI ventoy_wrapper_file_procotol(EFI_FILE_PROTOCOL *File)
+STATIC EFI_STATUS EFIAPI ventoy_wrapper_file_procotol(EFI_FILE_PROTOCOL *File, BOOLEAN Img)
 {
     File->Revision    = EFI_FILE_PROTOCOL_REVISION2;
     File->Open        = ventoy_wrapper_fs_open;
@@ -1383,7 +1397,7 @@ STATIC EFI_STATUS EFIAPI ventoy_wrapper_file_procotol(EFI_FILE_PROTOCOL *File)
     File->OpenEx      = ventoy_wrapper_file_open_ex;
     File->ReadEx      = ventoy_wrapper_file_read_ex;
     File->WriteEx     = ventoy_wrapper_file_write_ex;
-    File->FlushEx     = ventoy_wrapper_file_flush_ex;
+    File->FlushEx     = Img ? ventoy_wrapper_file_flush_ex_img : ventoy_wrapper_file_flush_ex;
 
     return EFI_SUCCESS;
 }
@@ -1402,6 +1416,7 @@ STATIC EFI_STATUS EFIAPI ventoy_wrapper_file_open
     UINT64 Sectors = 0;
     EFI_STATUS Status = EFI_SUCCESS;
     CHAR8 TmpName[256];
+    CHAR8 OldName[256];
     ventoy_virt_chunk *virt = NULL;
 
     debug("## ventoy_wrapper_file_open <%s> ", Name);
@@ -1422,6 +1437,7 @@ STATIC EFI_STATUS EFIAPI ventoy_wrapper_file_open
         return Status;
     }
 
+
     if (g_file_replace_list && g_file_replace_list->magic == GRUB_FILE_REPLACE_MAGIC &&
         g_file_replace_list->new_file_virtual_id < g_virt_chunk_num)
     {
@@ -1432,7 +1448,7 @@ STATIC EFI_STATUS EFIAPI ventoy_wrapper_file_open
             {
                 g_original_fclose(*New);
                 *New = &g_efi_file_replace.WrapperHandle;
-                ventoy_wrapper_file_procotol(*New);
+                ventoy_wrapper_file_procotol(*New, FALSE);
 
                 virt = g_virt_chunk + g_file_replace_list->new_file_virtual_id;
 
@@ -1453,6 +1469,49 @@ STATIC EFI_STATUS EFIAPI ventoy_wrapper_file_open
         }
 
         if (StrCmp(Name, L"\\EFI\\BOOT") == 0)
+        {
+            (*New)->Open = ventoy_wrapper_file_open;
+        }
+    }
+
+
+
+    if (g_img_replace_list && g_img_replace_list->magic == GRUB_IMG_REPLACE_MAGIC &&
+        g_img_replace_list->new_file_virtual_id < g_virt_chunk_num)
+    {
+        AsciiSPrint(TmpName, sizeof(TmpName), "%s", Name);
+        for (j = 0; j < g_img_replace_list->old_file_cnt; j++)
+        {
+            AsciiStrCpyS(OldName, sizeof(OldName), g_img_replace_list[i].old_file_name[j]);
+            if ((0 == AsciiStrCmp(OldName, TmpName)) ||
+                 (AsciiStrnCmp(OldName, "\\loader\\entries\\", 16) == 0 && 
+                  AsciiStrCmp(OldName + 16, TmpName) == 0
+                  )  
+                )
+            {
+                g_original_fclose(*New);
+                *New = &g_img_file_replace.WrapperHandle;
+                ventoy_wrapper_file_procotol(*New, TRUE);
+
+                virt = g_virt_chunk + g_img_replace_list->new_file_virtual_id;
+
+                Sectors = (virt->mem_sector_end - virt->mem_sector_start) + (virt->remap_sector_end - virt->remap_sector_start);
+                
+                g_img_file_replace.BlockIoSectorStart = virt->mem_sector_start;
+                g_img_file_replace.FileSizeBytes = Sectors * 2048;
+
+                if (gDebugPrint)
+                {
+                    debug("## ventoy_wrapper_file_open2 <%s> BlockStart:%lu Sectors:%lu Bytes:%lu", Name,
+                        g_img_file_replace.BlockIoSectorStart, Sectors, Sectors * 2048);
+                    sleep(3);
+                }
+                
+                return Status;
+            }
+        }
+
+        if (StrCmp(Name, L"\\loader\\entries") == 0)
         {
             (*New)->Open = ventoy_wrapper_file_open;
         }
